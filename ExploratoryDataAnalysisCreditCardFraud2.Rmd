@@ -1,0 +1,281 @@
+---
+title: 'Exploratory Data Analysis:  Credit Card Fraud'
+author: "Peter Caya"
+date: "January 25, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache= FALSE,echo = TRUE,message = FALSE,warning = FALSE)
+set.seed(13)
+# setwd("")
+library(pacman)
+p_load(data.table,dplyr,ggplot2, reshape,dtplyr,knitr,dplyr,caret,PRROC,pROC,DMwR,ROCR)
+CC <- fread(input = "creditcard.csv")
+```
+# Introduction
+
+This data was downloaded from the [Kaggle Credit Card Fraud](https://www.kaggle.com/dalpozz/creditcardfraud) page.  It is made up of 492 seperate frauds out of 284,807 transactions.  In order to preserve the integrity of the datasource, components aside from time and amount spent were processed into principal componets prior to the uploading of the dataset.  This leaves a total 30 features.  The principal components have no units, time is measured in seconds between time between the respective transaction and the first transaction in the data set.  Amount is the transaction amount.
+
+The aim of this report is to do the following:
+
+1. Examine the distribution of the features in the dataset.
+2. Propose seperate methods to sample the data to compensate for the unbalanced nature of the data.
+3. Implement logistic regression on a an appropriate training data set and test these results on a testing dataset.
+4. Examine the issue of feature selection in the logistic regression model.
+
+# Distribution  of Data
+
+The most notable aspect of this dataset is the imbalance between the fraudulent and legitimate transactions.  Fraudulent transactions make up `r round(sum(CC$Class==1)/length( CC$Class  )   *100,2)`% of the data.  This introduces a tricky but tractable aspect to measuring the quality of the model. For instance, a commonly used metric to evaluate the performance of classification algorithms is model accuracy:
+
+
+Consider the instance where the data contains 1% fraud and 99% legitimate transactions.    A  model which simply classifies transactions as legitimate while ignoring the possibility of fraud will have an accuracy of `r 1-(1+0)/100` .  To think that this model would be useful would be naive but this naive model might still be considered decent by someone without context.
+
+```{r summary}
+# Count NA values:
+NA_Counta <-apply(X = CC,MARGIN = 2,FUN = function(X){sum(is.na(X))})
+# Determine the distribution of each of the different factors
+Melted_Data <- melt(CC)
+Melted_Frauds <- melt(CC[which(CC$Class==1),])
+Melted_Legit <-  melt(CC[which(!CC$Class==1),])
+Melted_Data$Type <- "All Data"
+Melted_Frauds$Type <- "Frauds"
+Melted_Legit$Type <- "Normal"
+Plot_Data <-rbind(Melted_Data,Melted_Legit,Melted_Frauds)
+ggplot(data = Plot_Data %>% filter(grepl(x=variable,"V")) )+geom_boxplot(aes(x=variable,y=value ))+facet_grid(Type~.)+ggtitle("Features of Credit Card Data")+xlab("Features")
+```
+
+```{r, timeplot}
+ggplot(data = Plot_Data %>% filter(grepl(x=variable,"Time")) )   +geom_boxplot(aes(x=variable,y=value ))+facet_grid(.~Type)+ggtitle("Features of Credit Card Data")+xlab("Features")
+```
+
+Plot three shows an appreciable difference in the spending habits displayed between fraudulent and nonfraudulent transactions.  The legitimate transactions display a wider range of values than the fraudulent transactions.  Some of this appears to be related to outliers however.  
+
+```{r, Amount Plot}
+ggplot(data = Plot_Data %>% filter(grepl(x=variable,"Amount")) )   +geom_boxplot(aes(x=variable,y=value ))+facet_grid(.~Type)+ggtitle("Transaction Amounts")+xlab("")
+```
+
+To get a better idea where values depart between the fraudulent and non-fraudelent data, it would be helpful to determine where the factors depart the most:
+
+
+```{r, summary2}
+# sum_stats <- CC %>% group_by(Class) %>% summarise_at(.cols = vars(starts_with("V")), .funs = summary)  
+sum_stats <- CC %>% group_by(Class) %>% summarise_each( funs(summary))  
+
+sum_stats<-as.data.frame(t(sum_stats %>% select(-Class)))
+
+colnames(sum_stats)<-c("Min0","1Q0","2Q0","Mean0","3Q0","Max0","Min1","1Q1","2Q1","Mean1","3Q1","Max1")
+diff_table <- data.frame(   sum_stats$Min0-sum_stats$Min1,     sum_stats$`1Q0`- sum_stats$`1Q1`,     sum_stats$`2Q0`- sum_stats$`2Q1`,
+                            sum_stats$Mean0- sum_stats$Mean1    ,   sum_stats$`3Q0`- sum_stats$`3Q1`,  sum_stats$Max0- sum_stats$Max1  )
+names(diff_table)<-c("Min","1Q","2Q","Mean","3Q","Max")
+rownames(diff_table)<-rownames(sum_stats)
+kable(diff_table,digits = 2,align ="c",caption="Summary Statistics for Difference Between Features for Legitimate and Fraudulent Transactions")
+```
+
+Below is a table describing the difference between the standard deviations between the features we are evaluating for the model. The interesting thing with this dataset is that fraudulent transactions seem to have less of a variance than the legitimate transactions.
+
+```{r, summary3}
+  
+sum_stats <- CC %>% group_by(Class) %>% summarise_each( funs(sd))  
+
+sum_stats<-as.data.frame(t(sum_stats %>% select(-Class))) 
+hold <-rownames(sum_stats)
+colnames(sum_stats)<-c("Legitimate Transactions","Fraudulent Transactions")
+sum_stats<-sum_stats %>% mutate(`Standard Deviation Difference` = `Legitimate Transactions`- `Fraudulent Transactions`)
+rownames(sum_stats)<-hold
+kable(sum_stats,digits = 2,align ="c",caption="Standard Deviations for Difference Between Features for Legitimate and Fraudulent Transactions")
+```
+
+# Process
+
+## Measuring Accuracy
+
+One of the major issues with this dataset is that fraudulent transactions take up `r round(sum(CC$Class==1)/dim(CC)[1] *100 ,2)  `% of the data.  This level precludes the use of conventional classification accuracy.  A trivial model which automatically classifies a sample from our dataset as legitimate would have a very high accuracy while at the same time being completely useless for our purposes.
+
+To measure the accuracy of proposed models I will employ the following measures of classification accuracy:
+
+1. Kappa - 
+2. The area under the ROC curve.
+3. The area under the precision recall curve.
+
+## Sampling Methods
+
+Two common approaches used to correct for imbalances in data are oversampling and undersampling.  These methods process the data and add bias to the training dataset to compensate for data imbalance.  In this scenario oversampling will involve taking a sample of $N$ different values from the data involving legitimate transactions and then selecting a large enough number of duplicate transactions from the fraudulent data to produce a dataset which contains a 50% balance of either category.  Undersampling will involve sampling $N$ observations from the fraudulent data and then selecting a subset of the legitimate transactions which equal $N$.  
+
+Either of these methods has drawbacks.  There are clear outliers evident in the features so undersampling is likely to ignore these potentionally datapoints.  On the other hand, the use of oversampling for such an unbalanced dataset may be questionable due to potention overuse of the small dataset of fraudulent data. 
+
+For this introductory analysis, it was found that over and undersampling compromised the quality of the models that were ultimately fit.  
+
+As a result, both oversampled and undersampled datasets are used.
+
+
+```{r sampling_types}
+training_indices<-sample(1:dim(CC)[1],dim(CC)[1]*.01)
+training_data <- CC[training_indices,]
+testing_data <- CC[-training_indices,]
+
+train_under  <- downSample(training_data[,-31,with=FALSE],as.factor(training_data$Class))
+train_over <-   upSample(training_data[,-31,with=FALSE],as.factor(training_data$Class))
+```
+
+
+
+<!-- ## Data Compression -->
+
+<!-- Because of the number of variables present in this problem, a preliminary procedure I will use is applying principal components analysis to the training dataset I defined in the last section.  By using this method I isolated `r 5` which I will use to train a preliminary model using logistic regression. -->
+
+
+<!-- ```{r} -->
+<!-- # str(training_data) -->
+<!-- training_PCA <- prcomp(training_data %>% select(-Class) ,center = TRUE,scale. = TRUE) -->
+<!-- hold <- data.frame(1:length(training_PCA$sdev)[1],training_PCA$sdev) -->
+<!-- names(hold)<-c("Variable","Value") -->
+<!-- ggplot(hold)+geom_line(aes(x=Variable,y=Value)) +ggtitle("Plot of Training Data for Principal Components")+xlab("")+ylab("Principal Components") -->
+
+
+<!-- ``` -->
+
+# Analysis
+
+## Logistic Regression
+
+
+R's caret package was deployed to fit a logistic regression model using `r  ` different variables on the oversampled, undersampled and original training datasets.  After fitting the models on the training datasets, the models are tested on the test dataset in order to compare accuracy.  Logistic regression was employed on the thirty factors in the training dataset to train a model to identify fraudulent transactions.  10-folds cross-validations was used in order to resample the data which made up each model.   A model is built using the oversampled, undersampled and original data.  Their performance is compared on the testing data.
+
+
+```{r}
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 10)
+                     
+prim_model_over <- train(data = train_over,
+                                 method = "glm",
+                                 family = "binomial",
+                                 Class ~  . - Class,trControl = fitControl)
+
+prim_model_under <- train(data = train_under,
+                                 method = "glm",
+                                 family = "binomial",
+                                 Class ~  . - Class,trControl = fitControl)
+
+prim_model <- train(data = training_data,
+                                 method = "glm",
+                                 family = "binomial",
+                                 Class ~  . - Class,trControl = fitControl)
+```
+
+
+
+#### Results From Oversampling
+
+```{r}
+print(prim_model_over$results)
+print(confusionMatrix(prim_model_over)$table,positive="1")
+```
+
+#### Results From Undersampling
+
+```{r, echo=FALSE}
+print(prim_model_under$results)
+print(confusionMatrix(prim_model_under,positive="1"))
+```
+
+#### Results Using Initial Data
+
+```{r, echo=FALSE}
+print(prim_model$results)
+print(confusionMatrix(prim_model,positive="1")$table)
+
+```
+
+### Results on testing data
+
+#### Results From Oversampling
+
+```{r, echo=TRUE}
+prim_over_res<- predict(object = prim_model_over,newdata =testing_data )
+
+prim_over_res_tbl <- confusionMatrix(prim_over_res,testing_data$Class,positive="1")
+overtbl <-as.data.frame(prim_over_res_tbl$byClass)
+
+probs<- predict(object = prim_model_over,newdata =testing_data,type = "prob" )
+overcurve <-prediction(predictions = probs$`1`,labels = testing_data$Class)
+over_perf <- performance(overcurve,"tpr","fpr")
+over_pr_perf <- performance(overcurve,"prec","rec")
+
+```
+
+
+#### Results From Undersampling
+
+```{r}
+prim_under_res<- predict(object = prim_model_under,newdata =testing_data )
+prim_under_res_tbl <- confusionMatrix(prim_under_res,testing_data$Class,positive="1")
+undertbl <-as.data.frame(prim_under_res_tbl$byClass)
+
+probs<- predict(object = prim_model_under,newdata =testing_data,type = "prob" )
+undercurve <-prediction(predictions = probs$`1`,labels = testing_data$Class)
+under_perf <- performance(undercurve,"tpr","fpr")
+under_pr_perf <- performance(undercurve,"prec","rec")
+
+```
+
+
+#### Results From Original Data
+
+```{r}
+prim_res<- predict(object = prim_model,newdata =testing_data )
+prim_res_tbl <- confusionMatrix(prim_res,testing_data$Class,positive="1")
+kable(prim_res_tbl$table)
+normtbl <-as.data.frame(prim_res_tbl$byClass)
+names(normtbl) <- "Model Quality Measures"
+
+probs<- predict(object = prim_model,newdata =testing_data,type = "prob" )
+norm_curve <-prediction(predictions = probs$`1`,labels = testing_data$Class)
+norm_perf <- performance(norm_curve,"tpr","fpr")
+norm_pr_perf <- performance(norm_curve,"prec","rec")
+
+```
+
+
+We can see that the original training dataset which does not use over or undersampling outperforms the two models produced using these strategies to compensate for unbalanced data.  In the graphs below, it is evident that both the area under the receiver operator characteristic and the precision recall curves is greater for the the original data.  This is echod in the performance measure table as well where the training dataset without resampling outperforms the other two sample sets in many of the performance measures.
+
+```{r}
+table_for_display <- data.frame(overtbl,undertbl,normtbl)
+names(table_for_display)<-c("W/ Oversampling","W/ Undersampling", "No Resampling Based on Classes")
+kable(table_for_display,digits = 2,caption = "Comparison of accuracy measures for model results.")
+```
+
+
+
+```{r}
+plot(over_perf,col = "blue")
+par(new = T)
+plot(under_perf,col = "green")
+par(new = T)
+plot(norm_perf,main = "ROC Curve Comparison")
+legend("bottomright" ,c("Original Data","W/ Oversampling","W/ Undersampling"),col = c("black","blue","green")       , bty='n', cex=.75,  lty=1)
+```
+
+
+```{r}
+
+plot(over_pr_perf,col = "blue",xlim = c(.7,1),ylim = c(0,1))
+par(new = T)
+plot(under_pr_perf,col = "green",xlim = c(.7,1),ylim = c(0,1))
+par(new = T)
+plot(norm_pr_perf,xlim = c(.7,1),ylim = c(0,1),main = "PR Curve Comparison")
+legend("topright" ,c("Original Data","W/ Oversampling","W/ Undersampling"),col = c("black","blue","green")
+       , bty='n', cex=.75,  lty=1)
+```
+
+
+
+
+# Next Steps:
+
+1. Attempt more sophisticated methods for modifying the training dataset.  A method which has shown promising results from other Kagglers is SMOTE.
+2.  I'm interested in seeing the results that a kernel method produces.
+
+
+
